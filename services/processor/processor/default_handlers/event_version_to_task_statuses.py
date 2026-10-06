@@ -78,6 +78,8 @@ class VersionToTaskStatus(BaseEventHandler):
             ))
             return
 
+        only_last_version = event_settings.get("only_last_version", False)
+
         status_mapping = {
             item["name"].lower(): item["value"]
             for item in event_settings["mapping"]
@@ -116,6 +118,16 @@ class VersionToTaskStatus(BaseEventHandler):
                 continue
             asset_version_entities.append(asset_version)
             task_ids.add(asset_version["task_id"])
+
+        if only_last_version:
+            asset_version_entities = self.filter_last_asset_versions(
+                session, asset_version_entities
+            )
+            task_ids = {
+                asset_version["task_id"]
+                for asset_version in asset_version_entities
+            }
+        
 
         # Skipt if `task_ids` are empty
         if not task_ids:
@@ -162,6 +174,8 @@ class VersionToTaskStatus(BaseEventHandler):
         }
         for entity_info in entities_info:
             entity_id = entity_info["entityId"]
+            if entity_id not in asset_versions_by_id:
+                continue
             status_id = entity_info["changes"]["statusid"]["new"]
             status_name = status_name_by_id.get(status_id)
             if not status_name:
@@ -229,6 +243,48 @@ class VersionToTaskStatus(BaseEventHandler):
                     "[ {} ]Status couldn't be set".format(ent_path),
                     exc_info=True
                 )
+
+    def filter_last_asset_versions(self, session, asset_version_entities):
+        asset_ids = {
+            asset_version["asset_id"]
+            for asset_version in asset_version_entities
+        }
+        if not asset_ids:
+            return asset_version_entities
+
+        all_versions = session.query(
+            (
+                "select version, asset_id from AssetVersion"
+                " where asset_id in ({}) order by version descending"
+            ).format(self.join_query_keys(asset_ids))
+        ).all()
+
+        max_version_by_asset_id = {}
+        for version_entity in all_versions:
+            asset_id = version_entity["asset_id"]
+            if asset_id not in max_version_by_asset_id:
+                max_version_by_asset_id[asset_id] = version_entity["version"]
+
+        output = []
+        for asset_version in asset_version_entities:
+            asset_id = asset_version["asset_id"]
+            max_version = max_version_by_asset_id.get(asset_id)
+            if (
+                max_version is not None
+                and asset_version["version"] < max_version
+            ):
+                self.log.debug(
+                    "Skipping AssetVersion {} (v{}) - not the latest "
+                    "version (latest is v{}) on its asset.".format(
+                        asset_version["id"],
+                        asset_version["version"],
+                        max_version,
+                    )
+                )
+                continue
+            output.append(asset_version)
+
+        return output
 
     def statuses_for_tasks(self, session, task_entities, project_id):
         task_type_ids = set()
